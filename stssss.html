@@ -696,7 +696,7 @@ body.english-mode #accountModal > div > button {
                         </div>
                         <div class="flex justify-between items-center border-t border-slate-800 pt-2">
                             <span class="text-slate-400">الوقت المتبقي للدفع:</span>
-                            <span id="usdtCountdown" class="text-white font-mono font-black text-sm" dir="ltr">10:00</span>
+                            <span id="usdtCountdown" class="text-white font-mono font-black text-sm" dir="ltr">--:--</span>
                         </div>
                         <div id="usdtGraceRow" class="hidden flex justify-between items-start gap-3">
                             <span class="text-slate-400 whitespace-nowrap">يُراقَب التحويل حتى:</span>
@@ -1573,7 +1573,6 @@ body.english-mode #accountModal > div > button {
         // ===== USDT: واجهة الدفع + الربط مع الخادم (المرحلة 2) =====
         // الواجهة تعرض فقط ما يعيده الخادم. لا عناوين ثابتة، ولا إدخال TXID، ولا تغيير لحالة الطلب من المتصفح.
         // الإنشاء: create_usdt_order داخل requestUsdtOrder(). التحقق: verify-usdt-payment ثم قراءة orders.status. لا تسليم تلقائي.
-        const USDT_WINDOW_SECONDS = 600;
         const USDT_STATUS = {
             idle:     { text: 'لم يتم إنشاء الطلب بعد', cls: 'text-slate-300' },
             creating: { text: 'جاري إنشاء الطلب...', cls: 'text-sky-300' },
@@ -1645,7 +1644,7 @@ body.english-mode #accountModal > div > button {
             usdtEl('usdtAddress').textContent = '—';
             usdtEl('usdtQr').innerHTML = '';
             usdtEl('usdtQrWrap').classList.add('hidden');
-            usdtEl('usdtCountdown').textContent = usdtFormatTime(USDT_WINDOW_SECONDS);
+            usdtEl('usdtCountdown').textContent = '--:--';   // المهلة الحقيقية تأتي من payment_expires_at بعد إنشاء الطلب
             usdtEl('usdtCountdown').classList.remove('text-red-400');
             usdtSetStatus('idle');
             usdtUpdateButtons();
@@ -1787,15 +1786,42 @@ body.english-mode #accountModal > div > button {
             });
             usdtResetView();
         }
+        // يتحقق من ردّ create_usdt_order قبل عرض أي شيء. يرمي usdt_network_mismatch أو usdt_invalid_order_response.
+        // لا يوجد أي قيمة افتراضية: إن غاب حقل مطلوب يُرفض الطلب كاملاً.
+        function usdtValidateOrder(res, networkKey) {
+            const bad = (why) => { console.error('[USDT] ردّ مرفوض:', why); return new Error('usdt_invalid_order_response'); };
+            if (!res || typeof res !== 'object') throw bad('no_response');
+            const present = (v) => v !== null && v !== undefined && String(v).trim() !== '';
+            const missing = ['order_id', 'payment_id', 'deposit_address', 'usdt_amount', 'payment_expires_at', 'grace_until', 'total', 'currency']
+                .filter(k => !present(res[k]));
+            if (missing.length) throw bad('missing: ' + missing.join(','));
+
+            // الشبكة: يجب أن تطابق المختارة تماماً (بعد trim وأحرف صغيرة). غيابها يُرفض أيضاً.
+            const srvNet = typeof res.network === 'string' ? res.network.trim().toLowerCase() : '';
+            if (!srvNet || srvNet !== networkKey) {
+                console.error('[USDT] الشبكة المُعادة لا تطابق المختارة:', srvNet || '(فارغة)', '≠', networkKey);
+                throw new Error('usdt_network_mismatch');
+            }
+
+            const address = typeof res.deposit_address === 'string' ? res.deposit_address.trim() : '';
+            if (!address) throw bad('deposit_address');
+            const rawAmount = res.usdt_amount;
+            const amountText = (typeof rawAmount === 'string' || typeof rawAmount === 'number') ? String(rawAmount).trim() : '';
+            if (amountText === '' || !isFinite(Number(amountText)) || Number(amountText) <= 0) throw bad('usdt_amount');   // تحقق فقط، العرض بالنص الأصلي
+
+            const exp = new Date(res.payment_expires_at).getTime();
+            const grace = new Date(res.grace_until).getTime();
+            if (!isFinite(exp)) throw bad('payment_expires_at');
+            if (!isFinite(grace) || grace < exp) throw bad('grace_until');
+
+            if (typeof res.total === 'boolean' || !isFinite(Number(res.total)) || Number(res.total) <= 0) throw bad('total');
+            if (typeof res.currency !== 'string' || !res.currency.trim()) throw bad('currency');
+
+            return { address: address, amountText: amountText, expMs: exp, graceMs: grace, net: USDT_NETWORKS[networkKey] };
+        }
         // يعرض نتيجة create_usdt_order كما أعادها الخادم، دون أي تعديل على usdt_amount.
         function usdtApplyOrder(res, networkKey, itemsSnapshot, ownerId) {
-            const address = res && typeof res.deposit_address === 'string' ? res.deposit_address.trim() : '';
-            const rawAmount = res ? res.usdt_amount : null;
-            const amountText = (typeof rawAmount === 'string' || typeof rawAmount === 'number') ? String(rawAmount).trim() : '';
-            const amountOk = amountText !== '' && isFinite(Number(amountText)) && Number(amountText) > 0;   // تحقق فقط، العرض بالنص الأصلي
-            if (!res || !res.order_id || !address || !amountOk) throw new Error('usdt_invalid_order_response');
-            const srvNet = typeof res.network === 'string' ? res.network.trim().toLowerCase() : '';
-            const net = USDT_NETWORKS[srvNet] || USDT_NETWORKS[networkKey];   // اسم الشبكة كما أعادها الخادم إن كان معروفاً
+            const v = usdtValidateOrder(res, networkKey);   // يرمي قبل أي تعديل على الحالة أو الواجهة
             if (!ownerId) throw new Error('usdt_invalid_order_response');
             usdtState.order = res;
             usdtState.networkKey = networkKey;
@@ -1803,18 +1829,16 @@ body.english-mode #accountModal > div > button {
             usdtState.snapshot = { items: itemsSnapshot || [], total: res.total, currency: res.currency };   // من الخادم، لا من السلة
             usdtEl('usdtOrderNumber').textContent = res.order_number != null ? String(res.order_number) : '';
             usdtEl('usdtOrderNumberRow').classList.toggle('hidden', res.order_number == null);
-            usdtEl('usdtNetwork').textContent = net.label;
-            usdtEl('usdtAmount').textContent = amountText + ' USDT';
-            usdtEl('usdtAddress').textContent = address;
-            usdtRenderQr(address);
+            usdtEl('usdtNetwork').textContent = v.net.label;
+            usdtEl('usdtAmount').textContent = v.amountText + ' USDT';
+            usdtEl('usdtAddress').textContent = v.address;
+            usdtRenderQr(v.address);
             usdtSetStatus('waiting');
             usdtUpdateButtons();
-            const exp = res.payment_expires_at ? new Date(res.payment_expires_at).getTime() : NaN;
-            const grace = res.grace_until ? new Date(res.grace_until).getTime() : NaN;
-            usdtState.expiresMs = isFinite(exp) ? exp : Date.now() + USDT_WINDOW_SECONDS * 1000;
-            usdtState.graceMs = grace;
-            usdtEl('usdtGraceUntil').textContent = isFinite(grace) ? usdtFormatDate(grace) : '';
-            usdtEl('usdtGraceRow').classList.toggle('hidden', !isFinite(grace));
+            usdtState.expiresMs = v.expMs;   // من الخادم فقط
+            usdtState.graceMs = v.graceMs;
+            usdtEl('usdtGraceUntil').textContent = usdtFormatDate(v.graceMs);
+            usdtEl('usdtGraceRow').classList.remove('hidden');
             usdtStartCountdown(usdtState.expiresMs);
             usdtStartPolling();
         }
@@ -1823,14 +1847,16 @@ body.english-mode #accountModal > div > button {
         async function requestUsdtOrder(networkKey) {
             const info = getOrderInfo();
             const items = cartPayload();
-            const sig = 'usdt:' + networkKey + JSON.stringify(items);
+            const delivery = { discord: info.discord, character: info.char, region: info.region };
+            // أي تغيير في الشبكة أو السلة أو بيانات التسليم يولّد مفتاحاً جديداً؛ التكرار بنفس القيم يعيد المفتاح نفسه.
+            const sig = JSON.stringify({ m: 'usdt', network: networkKey, items: items, delivery: delivery });
             if (idemSig !== sig) {
                 idemSig = sig;
                 idemKey = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(36).slice(2));
             }
             const { data, error } = await supabaseClient.rpc('create_usdt_order', {
                 p_items: items,
-                p_delivery: { discord: info.discord, character: info.char, region: info.region },
+                p_delivery: delivery,
                 p_idempotency_key: idemKey,
                 p_network: networkKey
             });
@@ -1845,6 +1871,7 @@ body.english-mode #accountModal > div > button {
             const networkKey = usdtEl('usdtNetworkSelect').value;
             if (!USDT_NETWORKS[networkKey]) return;
             usdtState.busy = true; checkoutBusy = true;
+            let rejectedRes = null;
             usdtSetStatus('creating');
             usdtUpdateButtons();
             try {
@@ -1852,11 +1879,18 @@ body.english-mode #accountModal > div > button {
                 const itemsSnapshot = cart.map(i => ({ name: i.name, qty: i.qty }));
                 const ownerId = window.currentUser && window.currentUser.id;
                 const res = await requestUsdtOrder(networkKey);
+                rejectedRes = res;
                 if (!window.currentUser || window.currentUser.id !== ownerId) throw new Error('usdt_owner_changed');
                 usdtApplyOrder(res, networkKey, itemsSnapshot, ownerId);
             } catch (e) {
                 const msg = (e && e.message) || '';
-                if (msg === 'usdt_invalid_order_response') usdtSetStatus('error', 'استجابة غير صالحة من الخادم. حاول مرة أخرى.');
+                if (msg === 'usdt_invalid_order_response' || msg === 'usdt_network_mismatch') {
+                    // الطلب مرفوض: نحاول إلغاء ما أنشأه الخادم (إن أعاد order_id) ونُجبر مفتاحاً جديداً للمحاولة التالية.
+                    const rid = rejectedRes && typeof rejectedRes === 'object' ? rejectedRes.order_id : null;
+                    if (rid !== null && rid !== undefined && String(rid).trim() !== '') await tryCancelOrder(rid); else idemSig = null;
+                }
+                if (msg === 'usdt_network_mismatch') usdtSetStatus('error', 'الشبكة المُعادة من الخادم لا تطابق الشبكة المختارة. لم يُعتمد الطلب، لا تحوّل أي مبلغ. حاول مرة أخرى.');
+                else if (msg === 'usdt_invalid_order_response') usdtSetStatus('error', 'استجابة غير صالحة من الخادم. حاول مرة أخرى.');
                 else if (msg === 'usdt_owner_changed') usdtSetStatus('error', 'تغيّر الحساب أثناء إنشاء الطلب. راجع «طلباتي» بعد تسجيل الدخول بالحساب الأصلي.');
                 else usdtSetStatus('error', friendlyError(e));
             } finally {
@@ -3304,6 +3338,7 @@ body.english-mode #accountModal > div > button {
     'الدفع عبر USDT غير مفعّل بعد.':'USDT payment is not enabled yet.','إنشاء الطلب وعرض عنوان الدفع':'Create Order & Show Payment Address',
     'اختر شبكة التحويل':'Choose transfer network','تعذّر تحميل رمز QR. استخدم عنوان الإيداع أعلاه.':'Could not load the QR code. Use the deposit address above.',
     'استجابة غير صالحة من الخادم. حاول مرة أخرى.':'Invalid server response. Please try again.',
+    'الشبكة المُعادة من الخادم لا تطابق الشبكة المختارة. لم يُعتمد الطلب، لا تحوّل أي مبلغ. حاول مرة أخرى.':'The network returned by the server does not match the selected network. The order was not accepted; do not send any funds. Please try again.',
     'متجر Once Human - خدمات وموارد وانس هيومن الاحترافية':'Once Human Store - Premium Services & Resources',
     'متجر خدمات وموارد وانس هيومن':'Once Human Services & Resources',
     'SAR (ر.س)':'SAR (ر.س)',
