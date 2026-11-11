@@ -1577,7 +1577,8 @@ body.english-mode #accountModal > div > button {
             idle:     { text: 'لم يتم إنشاء الطلب بعد', cls: 'text-slate-300' },
             creating: { text: 'جاري إنشاء الطلب...', cls: 'text-sky-300' },
             waiting:  { text: 'بانتظار التحويل', cls: 'text-amber-300' },
-            expired:  { text: 'انتهت مهلة الدفع. أنشئ طلباً جديداً.', cls: 'text-red-400' },
+            review:   { text: 'وصلت بيانات دفع تحتاج إلى مراجعة الإدارة. لا ترسل دفعة أخرى.', cls: 'text-sky-300' },
+            expired:  { text: 'انتهت مهلة الدفع بعد التحقق من الخادم. أنشئ طلباً جديداً عند الحاجة.', cls: 'text-red-400' },
             error:    { text: 'تعذّر إنشاء الطلب', cls: 'text-red-400' },
             grace:    { text: 'انتهى الوقت الأساسي. ما زال الخادم يتحقق من أي تحويل وصل.', cls: 'text-amber-300' }
         };
@@ -1702,11 +1703,9 @@ body.english-mode #accountModal > div > button {
                 if (left > 0) return;
                 usdtStopTimer();
                 usdtEl('usdtCountdown').classList.add('text-red-400');
-                if (isFinite(usdtState.graceMs) && usdtState.graceMs > Date.now()) {
-                    usdtSetStatus('grace');
-                } else {
-                    usdtExpireView();
-                }
+                // لا يقرر المتصفح انتهاء الطلب اعتماداً على الساعة المحلية.
+                // يستمر التحقق حتى يعيد الخادم الحالة النهائية بعد فحص Binance.
+                usdtSetStatus('grace');
             };
             tick();
             if (usdtState.order && !usdtState.timer && usdtEl('usdtCountdown').textContent !== '00:00') usdtState.timer = setInterval(tick, 1000);
@@ -1740,20 +1739,32 @@ body.english-mode #accountModal > div > button {
                 const me = window.currentUser;
                 if (!me || me.id !== usdtState.ownerId) { usdtAbortForOwner(); return; }
                 // جسم الطلب: { order_id } فقط.
-                const { error } = await supabaseClient.functions.invoke('verify-usdt-payment', { body: { order_id: order.order_id } });
+                const { data: verifyData, error } = await supabaseClient.functions.invoke('verify-usdt-payment', { body: { order_id: order.order_id } });
                 if (error) console.warn('[USDT] verify-usdt-payment:', error.message || error);
-                // الحقيقة هنا: حالة الطلب في قاعدة البيانات.
+                // نجاح الدفع لا يُستنتج من رد Edge Function؛ نقرأ حالة الطلب من قاعدة البيانات.
                 const status = await usdtFetchOrderStatus(order.order_id, usdtState.ownerId);
                 if (gen !== usdtState.pollGen || usdtState.order !== order) return;
                 if (USDT_PAID_STATUSES.indexOf(status) !== -1) { usdtOnPaid(order, status); return; }
+                // حالة المراجعة ليست نجاحاً ولا تمسح السلة؛ مصدرها رد الخادم الموثق.
+                if (!error && verifyData && verifyData.status === 'under_review') {
+                    usdtStopTimer();
+                    usdtStopPolling();
+                    usdtSetStatus('review');
+                    return;
+                }
+                // انتهاء الطلب يُقبل فقط من الخادم بعد معالجة سجل Binance.
+                if (!error && verifyData && verifyData.status === 'expired' && status === 'expired') {
+                    usdtExpireView();
+                    return;
+                }
             } catch (e) {
                 console.warn('[USDT] تعذّر التحقق هذه المرة:', e && e.message ? e.message : e);
             } finally {
                 if (gen === usdtState.pollGen) usdtState.polling = false;
             }
             if (gen !== usdtState.pollGen || usdtState.order !== order) return;
-            const endMs = isFinite(usdtState.graceMs) ? usdtState.graceMs : usdtState.expiresMs;
-            if (isFinite(endMs) && Date.now() > endMs) { usdtExpireView(); return; }
+            // لا نوقف المتابعة محلياً عند انتهاء الوقت؛ الخادم وحده يقرر expired
+            // بعد فحص سجل Binance. أخطاء الشبكة لا تحوّل الطلب إلى منتهي أو مدفوع.
             usdtState.pollTimer = setTimeout(() => usdtPollOnce(gen), USDT_POLL_MS);
         }
         function usdtStartPolling() {
@@ -1768,7 +1779,7 @@ body.english-mode #accountModal > div > button {
             if (USDT_PAID_STATUSES.indexOf(verifiedStatus) === -1) return;
             const snap = usdtState.snapshot || {};
             const networkKey = usdtState.networkKey;
-            const orderNumber = order.order_number != null ? String(order.order_number) : String(order.order_id);
+            const orderNumber = String(order.order_number);
             usdtStopTimer();
             usdtStopPolling();
             usdtState.order = null;
@@ -1792,7 +1803,7 @@ body.english-mode #accountModal > div > button {
             const bad = (why) => { console.error('[USDT] ردّ مرفوض:', why); return new Error('usdt_invalid_order_response'); };
             if (!res || typeof res !== 'object') throw bad('no_response');
             const present = (v) => v !== null && v !== undefined && String(v).trim() !== '';
-            const missing = ['order_id', 'payment_id', 'deposit_address', 'usdt_amount', 'payment_expires_at', 'grace_until', 'total', 'currency']
+            const missing = ['order_id', 'order_number', 'payment_id', 'deposit_address', 'usdt_amount', 'payment_expires_at', 'grace_until', 'total', 'currency']
                 .filter(k => !present(res[k]));
             if (missing.length) throw bad('missing: ' + missing.join(','));
 
@@ -1827,8 +1838,8 @@ body.english-mode #accountModal > div > button {
             usdtState.networkKey = networkKey;
             usdtState.ownerId = ownerId;
             usdtState.snapshot = { items: itemsSnapshot || [], total: res.total, currency: res.currency };   // من الخادم، لا من السلة
-            usdtEl('usdtOrderNumber').textContent = res.order_number != null ? String(res.order_number) : '';
-            usdtEl('usdtOrderNumberRow').classList.toggle('hidden', res.order_number == null);
+            usdtEl('usdtOrderNumber').textContent = String(res.order_number);
+            usdtEl('usdtOrderNumberRow').classList.remove('hidden');
             usdtEl('usdtNetwork').textContent = v.net.label;
             usdtEl('usdtAmount').textContent = v.amountText + ' USDT';
             usdtEl('usdtAddress').textContent = v.address;
@@ -1871,7 +1882,6 @@ body.english-mode #accountModal > div > button {
             const networkKey = usdtEl('usdtNetworkSelect').value;
             if (!USDT_NETWORKS[networkKey]) return;
             usdtState.busy = true; checkoutBusy = true;
-            let rejectedRes = null;
             usdtSetStatus('creating');
             usdtUpdateButtons();
             try {
@@ -1879,17 +1889,16 @@ body.english-mode #accountModal > div > button {
                 const itemsSnapshot = cart.map(i => ({ name: i.name, qty: i.qty }));
                 const ownerId = window.currentUser && window.currentUser.id;
                 const res = await requestUsdtOrder(networkKey);
-                rejectedRes = res;
                 if (!window.currentUser || window.currentUser.id !== ownerId) throw new Error('usdt_owner_changed');
                 usdtApplyOrder(res, networkKey, itemsSnapshot, ownerId);
             } catch (e) {
                 const msg = (e && e.message) || '';
-                if (msg === 'usdt_invalid_order_response' || msg === 'usdt_network_mismatch') {
-                    // الطلب مرفوض: نحاول إلغاء ما أنشأه الخادم (إن أعاد order_id) ونُجبر مفتاحاً جديداً للمحاولة التالية.
-                    const rid = rejectedRes && typeof rejectedRes === 'object' ? rejectedRes.order_id : null;
-                    if (rid !== null && rid !== undefined && String(rid).trim() !== '') await tryCancelOrder(rid); else idemSig = null;
+                if (msg === 'usdt_invalid_order_response' || msg === 'usdt_network_mismatch' || msg.includes('usdt_idempotency_network_mismatch')) {
+                    // لا نلغي أي طلب من المتصفح هنا؛ قد تكون الاستجابة مرتبطة بطلب سابق صالح.
+                    // تُجبر المحاولة التالية على مفتاح idempotency جديد دون تغيير حالة الطلب القديم.
+                    idemSig = null;
                 }
-                if (msg === 'usdt_network_mismatch') usdtSetStatus('error', 'الشبكة المُعادة من الخادم لا تطابق الشبكة المختارة. لم يُعتمد الطلب، لا تحوّل أي مبلغ. حاول مرة أخرى.');
+                if (msg === 'usdt_network_mismatch' || msg.includes('usdt_idempotency_network_mismatch')) usdtSetStatus('error', 'مفتاح الطلب السابق مرتبط بشبكة مختلفة. لم يتم إنشاء طلب جديد ولم يتم إلغاء الطلب السابق. ابدأ محاولة جديدة بعد مراجعة طلباتك.');
                 else if (msg === 'usdt_invalid_order_response') usdtSetStatus('error', 'استجابة غير صالحة من الخادم. حاول مرة أخرى.');
                 else if (msg === 'usdt_owner_changed') usdtSetStatus('error', 'تغيّر الحساب أثناء إنشاء الطلب. راجع «طلباتي» بعد تسجيل الدخول بالحساب الأصلي.');
                 else usdtSetStatus('error', friendlyError(e));
@@ -2511,7 +2520,7 @@ body.english-mode #accountModal > div > button {
             left.appendChild(mk('div', 'text-white font-bold font-mono text-sm truncate', o.order_number || '—'));
             left.appendChild(mk('div', 'text-[11px] text-slate-500 mt-0.5', o.created_at ? new Date(o.created_at).toLocaleString('ar') : '—'));
             let statusKey = String(o.status || '').toLowerCase();
-            const underReview = statusKey === 'pending_payment' && Array.isArray(o.payments) && o.payments.some(p => p.status === 'under_review');
+            const underReview = ['pending_payment', 'expired', 'cancelled'].includes(statusKey) && Array.isArray(o.payments) && o.payments.some(p => p.status === 'under_review');
             if (underReview) statusKey = 'under_review';
             const badge = mk('span', 'shrink-0 text-[11px] font-bold px-2.5 py-1 rounded-lg border ' + (ORDER_STATUS_STYLES[statusKey] || 'bg-slate-800 text-slate-300 border-slate-700'),
                 ORDER_STATUS_LABELS[statusKey] || o.status || '—');
@@ -3039,8 +3048,8 @@ body.english-mode #accountModal > div > button {
             act.appendChild(btn('تفاصيل', 'bg-slate-900 border-slate-700 text-slate-200 hover:border-starlight', () => openDetails(row)));
             if (S.tbl === 'orders' && hasId && !custom()) act.appendChild(btn('سجل الطلب', 'bg-slate-900 border-cyan-500/40 text-cyan-300 hover:border-cyan-300', () => openOrderAudit(row)));
             if (S.tbl === 'products' && hasId && !custom()) act.appendChild(btn('المخزون', 'bg-slate-900 border-emerald-500/40 text-emerald-300', () => openStock(row)));
-            if (S.tbl === 'payments' && row.status === 'under_review' && row.method === 'manual' && hasId) {
-                act.appendChild(btn('قبول', 'bg-slate-900 border-emerald-500/40 text-emerald-300', () => reviewPayment(row, true)));
+            if (S.tbl === 'payments' && row.status === 'under_review' && ['manual', 'usdt'].includes(String(row.method || '').toLowerCase()) && hasId) {
+                act.appendChild(btn(row.method === 'usdt' ? 'قبول USDT (تسليم يدوي)' : 'قبول', 'bg-slate-900 border-emerald-500/40 text-emerald-300', () => reviewPayment(row, true)));
                 act.appendChild(btn('رفض', 'bg-slate-900 border-red-500/40 text-red-300', () => reviewPayment(row, false)));
             }
             if (can('edit') && hasId) act.appendChild(btn('تعديل', 'bg-slate-900 border-slate-700 text-starlight hover:border-starlight', () => openForm(row)));
@@ -3291,12 +3300,38 @@ body.english-mode #accountModal > div > button {
         ]);
     }
     async function reviewPayment(row, approve) {
-        const note = approve ? null : (prompt('سبب الرفض (اختياري):') || null);
-        if (!confirm(approve ? 'قبول هذه الدفعة وإكمال الطلب؟' : 'رفض الدفعة؟ سيُلغى الطلب ويُعاد المخزون.')) return;
         if (!(await guard())) return;
-        const r = await supabaseClient.rpc('admin_review_manual_payment', { p_payment_id: row.id, p_approve: approve, p_note: note });
+        const isUsdt = String(row.method || '').toLowerCase() === 'usdt';
+        let evidenceText = '';
+        if (isUsdt) {
+            const evidence = await supabaseClient.rpc('admin_get_usdt_review_details', { p_payment_id: row.id });
+            if (evidence.error || !evidence.data) {
+                msg('تعذّر جلب تفاصيل مراجعة USDT: ' + (evidence.error ? evidence.error.message : 'لا توجد تفاصيل'), 'err');
+                return;
+            }
+            const d = evidence.data;
+            const candidates = Array.isArray(d.review_candidates) ? d.review_candidates : [];
+            evidenceText = '\n\nتفاصيل USDT:' +
+                '\nالشبكة: ' + (d.network || '—') +
+                '\nالمبلغ المطلوب: ' + (d.target_amount || '—') +
+                '\nالعنوان: ' + (d.deposit_address || '—') +
+                '\nسبب المراجعة: ' + (d.review_reason || '—') +
+                '\nعدد الإيداعات المرشحة: ' + candidates.length +
+                (candidates.length ? '\nالمرشحات: ' + candidates.map((c, i) =>
+                    (i + 1) + ') ' + [c.network, c.amount, c.txId, c.insertTime ? new Date(Number(c.insertTime)).toISOString() : ''].filter(Boolean).join(' | ')
+                ).join('\n') : '');
+        }
+        const note = approve ? null : (prompt('سبب الرفض (اختياري):' + evidenceText) || null);
+        const confirmText = isUsdt
+            ? (approve ? 'اعتماد دفعة USDT؟ سيتم تحويل الطلب إلى مدفوع وإنشاء تسليم يدوي pending فقط، دون تسليم رقمي تلقائي.' : 'رفض دفعة USDT؟' ) + evidenceText
+            : (approve ? 'قبول هذه الدفعة وإكمال الطلب؟' : 'رفض الدفعة؟ سيُلغى الطلب ويُعاد المخزون.');
+        if (!confirm(confirmText)) return;
+        // USDT المتأخر له RPC منفصل: لا يستدعي _mark_order_paid ولا التسليم الرقمي التلقائي.
+        const reviewRpc = isUsdt ? 'admin_review_usdt_payment' : 'admin_review_manual_payment';
+        const r = await supabaseClient.rpc(reviewRpc, { p_payment_id: row.id, p_approve: approve, p_note: note });
         if (r.error) { msg('تعذّرت المراجعة: ' + r.error.message, 'err'); return; }
-        msg(approve ? 'تم قبول الدفعة ✅' : 'تم رفض الدفعة وإعادة المخزون ✅', 'ok'); load();
+        msg(approve ? (isUsdt ? 'تم اعتماد USDT للتسليم اليدوي ✅' : 'تم قبول الدفعة ✅') : 'تم رفض الدفعة وإعادة المخزون ✅', 'ok');
+        load();
     }
     async function remove(row) {
         if (!confirm('حذف هذا السجل نهائياً؟ لا يمكن التراجع.')) return;
@@ -3334,6 +3369,7 @@ body.english-mode #accountModal > div > button {
   const translations = {
     'عنوان الإيداع:':'Deposit Address:','الوقت المتبقي للدفع:':'Time left to pay:','حالة الدفع:':'Payment Status:',
     'لم يتم إنشاء الطلب بعد':'Order not created yet','جاري إنشاء الطلب...':'Creating order...','بانتظار التحويل':'Awaiting transfer',
+    'وصلت بيانات دفع تحتاج إلى مراجعة الإدارة. لا ترسل دفعة أخرى.':'Payment details require admin review. Do not send another payment.',
     'انتهت مهلة الدفع. أنشئ طلباً جديداً.':'Payment window expired. Create a new order.','تعذّر إنشاء الطلب':'Could not create the order',
     'الدفع عبر USDT غير مفعّل بعد.':'USDT payment is not enabled yet.','إنشاء الطلب وعرض عنوان الدفع':'Create Order & Show Payment Address',
     'اختر شبكة التحويل':'Choose transfer network','تعذّر تحميل رمز QR. استخدم عنوان الإيداع أعلاه.':'Could not load the QR code. Use the deposit address above.',
